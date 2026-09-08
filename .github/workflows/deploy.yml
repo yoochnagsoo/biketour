@@ -26,6 +26,8 @@ jobs:
       - uses: actions/configure-pages@v5
       - run: npm ci
       - run: npm run build
+        env:
+          NEXT_PUBLIC_NAVER_MAP_CLIENT_ID: ${{ vars.NAVER_MAP_CLIENT_ID }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: ./out

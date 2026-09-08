@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Bike Tour",
-  description: "Bike Tour",
+  title: "바이크 투어 | 라이딩 기록",
+  description: "GPS로 라이딩 거리와 속도를 기록하세요.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
