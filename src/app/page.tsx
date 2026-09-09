@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type RideStatus =
   | "idle"
@@ -29,8 +29,14 @@ type RideSnapshot = {
 type NaverLatLng = object;
 
 type NaverMap = {
+  destroy(): void;
+  fitBounds(bounds: NaverLatLngBounds, padding?: object): void;
   setCenter(position: NaverLatLng): void;
   setZoom(zoom: number): void;
+};
+
+type NaverLatLngBounds = {
+  extend(position: NaverLatLng): void;
 };
 
 type NaverPolyline = {
@@ -45,6 +51,7 @@ type NaverMarker = {
 
 type NaverMapsApi = {
   LatLng: new (latitude: number, longitude: number) => NaverLatLng;
+  LatLngBounds: new () => NaverLatLngBounds;
   Map: new (element: HTMLElement, options: object) => NaverMap;
   Polyline: new (options: object) => NaverPolyline;
   Marker: new (options: object) => NaverMarker;
@@ -134,7 +141,9 @@ export default function Home() {
   const [mapError, setMapError] = useState(false);
   const [showInstallHint, setShowInstallHint] = useState(false);
   const [installGuideOpen, setInstallGuideOpen] = useState(false);
-  const [savedRideCount, setSavedRideCount] = useState(0);
+  const [savedRides, setSavedRides] = useState<SavedRide[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [selectedRide, setSelectedRide] = useState<SavedRide | null>(null);
 
   const mapElementRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<NaverMap | null>(null);
@@ -182,7 +191,7 @@ export default function Home() {
     try {
       const savedRides = JSON.parse(localStorage.getItem("biketour-rides") ?? "[]");
       if (Array.isArray(savedRides)) {
-        queueMicrotask(() => setSavedRideCount(savedRides.length));
+        queueMicrotask(() => setSavedRides(savedRides));
       }
     } catch {
       // Ignore malformed data from an older app version.
@@ -620,7 +629,7 @@ export default function Home() {
       const rides = Array.isArray(savedRides) ? savedRides : [];
       const updatedRides = [ride, ...rides].slice(0, 50);
       localStorage.setItem("biketour-rides", JSON.stringify(updatedRides));
-      setSavedRideCount(updatedRides.length);
+      setSavedRides(updatedRides);
       return true;
     } catch {
       return false;
@@ -689,19 +698,38 @@ export default function Home() {
             </p>
             <h1 className="mt-1 text-xl font-semibold tracking-tight">라이딩 기록</h1>
           </div>
-          <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.06] px-3 py-2 text-xs font-medium text-white/70">
-            <span
-              className={`h-2 w-2 rounded-full ${
-                status === "recording"
-                  ? "animate-pulse bg-emerald-400"
-                  : status === "paused"
-                    ? "animate-pulse bg-amber-300"
-                  : status === "error"
-                    ? "bg-amber-400"
-                    : "bg-white/30"
-              }`}
-            />
-            {statusLabel}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={isRiding}
+              onClick={() => {
+                setSelectedRide(null);
+                setHistoryOpen(true);
+              }}
+              className="relative grid h-9 w-9 place-items-center rounded-full border border-white/10 bg-white/[0.06] text-white/65 transition enabled:active:scale-95 disabled:opacity-30"
+              aria-label={`저장된 라이딩 ${savedRides.length}개 보기`}
+            >
+              <span aria-hidden="true">☰</span>
+              {savedRides.length > 0 && (
+                <span className="absolute -right-1 -top-1 min-w-4 rounded-full bg-emerald-400 px-1 text-center text-[9px] font-bold leading-4 text-[#04251a]">
+                  {Math.min(savedRides.length, 99)}
+                </span>
+              )}
+            </button>
+            <div className="flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.06] px-3 py-2 text-xs font-medium text-white/70">
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  status === "recording"
+                    ? "animate-pulse bg-emerald-400"
+                    : status === "paused"
+                      ? "animate-pulse bg-amber-300"
+                    : status === "error"
+                      ? "bg-amber-400"
+                      : "bg-white/30"
+                }`}
+              />
+              {statusLabel}
+            </div>
           </div>
         </header>
 
@@ -851,10 +879,24 @@ export default function Home() {
             </button>
           )}
           <p className="mt-3 text-center text-[11px] leading-4 text-white/35">
-            저장된 라이딩 {savedRideCount}개 · 라이딩 중 화면을 켜두세요.
+            저장된 라이딩 {savedRides.length}개 · 라이딩 중 화면을 켜두세요.
           </p>
         </div>
       </div>
+
+      {historyOpen && (
+        <RideHistory
+          rides={savedRides}
+          selectedRide={selectedRide}
+          mapReady={mapReady}
+          onSelect={setSelectedRide}
+          onBack={() => setSelectedRide(null)}
+          onClose={() => {
+            setSelectedRide(null);
+            setHistoryOpen(false);
+          }}
+        />
+      )}
 
       {installGuideOpen && (
         <div
@@ -900,6 +942,300 @@ export default function Home() {
         </div>
       )}
     </main>
+  );
+}
+
+function RideHistory({
+  rides,
+  selectedRide,
+  mapReady,
+  onSelect,
+  onBack,
+  onClose,
+}: {
+  rides: SavedRide[];
+  selectedRide: SavedRide | null;
+  mapReady: boolean;
+  onSelect: (ride: SavedRide) => void;
+  onBack: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <section className="fixed inset-0 z-40 overflow-y-auto bg-[#07110f] text-white">
+      <div className="mx-auto min-h-dvh w-full max-w-lg px-4 pb-[calc(env(safe-area-inset-bottom)+1.5rem)] pt-[calc(env(safe-area-inset-top)+1.25rem)]">
+        <header className="mb-5 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            {selectedRide && (
+              <button
+                type="button"
+                onClick={onBack}
+                className="grid h-10 w-10 place-items-center rounded-full bg-white/[0.07] text-xl text-white/70"
+                aria-label="라이딩 목록으로 돌아가기"
+              >
+                ‹
+              </button>
+            )}
+            <div>
+              <p className="text-[11px] font-semibold tracking-[0.25em] text-emerald-400">
+                RIDE HISTORY
+              </p>
+              <h2 className="mt-1 text-xl font-bold">
+                {selectedRide ? "라이딩 상세" : "저장된 라이딩"}
+              </h2>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="grid h-10 w-10 place-items-center rounded-full bg-white/[0.07] text-xl text-white/60"
+            aria-label="라이딩 보관함 닫기"
+          >
+            ×
+          </button>
+        </header>
+
+        {selectedRide ? (
+          <RideDetail ride={selectedRide} mapReady={mapReady} />
+        ) : rides.length > 0 ? (
+          <div className="space-y-3">
+            {rides.map((ride, index) => (
+              <button
+                key={ride.id}
+                type="button"
+                onClick={() => onSelect(ride)}
+                className="w-full rounded-3xl border border-white/[0.08] bg-white/[0.045] p-5 text-left transition active:scale-[0.99] active:bg-white/[0.07]"
+              >
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-xs text-white/40">
+                      {new Intl.DateTimeFormat("ko-KR", {
+                        year: "numeric",
+                        month: "long",
+                        day: "numeric",
+                        weekday: "short",
+                      }).format(new Date(ride.startedAt))}
+                    </p>
+                    <p className="mt-1 text-base font-semibold">
+                      {new Intl.DateTimeFormat("ko-KR", {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      }).format(new Date(ride.startedAt))} {index === 0 && (
+                        <span className="ml-1 rounded-full bg-emerald-400/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
+                          최근
+                        </span>
+                      )}
+                    </p>
+                  </div>
+                  <span className="text-xl text-white/25">›</span>
+                </div>
+                <div className="mt-5 grid grid-cols-3 gap-3 border-t border-white/[0.07] pt-4">
+                  <HistoryValue
+                    label="거리"
+                    value={`${(ride.summary.distanceM / 1000).toFixed(2)} km`}
+                  />
+                  <HistoryValue
+                    label="전체시간"
+                    value={formatDuration(ride.summary.totalMs)}
+                  />
+                  <HistoryValue
+                    label="휴식"
+                    value={formatDuration(ride.summary.restMs ?? 0)}
+                  />
+                </div>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="grid min-h-[55dvh] place-items-center text-center">
+            <div>
+              <div className="mx-auto grid h-16 w-16 place-items-center rounded-full bg-white/[0.06] text-2xl">
+                ☷
+              </div>
+              <p className="mt-5 font-semibold">아직 저장된 라이딩이 없어요</p>
+              <p className="mt-2 text-sm leading-6 text-white/40">
+                라이딩을 종료하면 통계와 경로가<br />이 보관함에 자동으로 저장됩니다.
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function RideDetail({ ride, mapReady }: { ride: SavedRide; mapReady: boolean }) {
+  const summary = ride.summary;
+
+  return (
+    <div>
+      <p className="mb-3 text-sm text-white/45">
+        {new Intl.DateTimeFormat("ko-KR", {
+          dateStyle: "long",
+          timeStyle: "short",
+        }).format(new Date(ride.startedAt))}
+      </p>
+      <SavedRideMap ride={ride} mapReady={mapReady} />
+
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <DetailMetric
+          label="총 이동거리"
+          value={(summary.distanceM / 1000).toFixed(2)}
+          unit="km"
+          featured
+        />
+        <DetailMetric label="총 이동시간" value={formatDuration(summary.totalMs)} />
+        <DetailMetric
+          label="평균속도"
+          value={summary.averageSpeedKmh.toFixed(1)}
+          unit="km/h"
+        />
+        <DetailMetric
+          label="최대속도"
+          value={summary.maxSpeedKmh.toFixed(1)}
+          unit="km/h"
+        />
+        <DetailMetric label="정지시간" value={formatDuration(summary.stoppedMs)} />
+        <DetailMetric
+          label="휴식시간"
+          value={formatDuration(summary.restMs ?? 0)}
+          featured="rest"
+        />
+      </div>
+
+      <div className="mt-3 flex items-center justify-between rounded-2xl border border-white/[0.08] bg-white/[0.045] px-5 py-4 text-sm">
+        <span className="text-white/45">휴식 지점</span>
+        <strong>{ride.pauses?.length ?? 0}개</strong>
+      </div>
+    </div>
+  );
+}
+
+function SavedRideMap({ ride, mapReady }: { ride: SavedRide; mapReady: boolean }) {
+  const elementRef = useRef<HTMLDivElement>(null);
+  const routeSegments = useMemo(
+    () => ride.routeSegments ?? [],
+    [ride.routeSegments],
+  );
+  const pointCount = routeSegments.reduce(
+    (count, segment) => count + segment.length,
+    0,
+  );
+
+  useEffect(() => {
+    if (!mapReady || !window.naver || !elementRef.current || pointCount === 0) {
+      return;
+    }
+
+    const maps = window.naver.maps;
+    const firstPoint = routeSegments.find((segment) => segment.length)?.[0];
+    if (!firstPoint) return;
+
+    const map = new maps.Map(elementRef.current, {
+      center: new maps.LatLng(firstPoint.latitude, firstPoint.longitude),
+      zoom: 15,
+      zoomControl: false,
+      scaleControl: false,
+      mapDataControl: false,
+    });
+    const bounds = new maps.LatLngBounds();
+    const overlays: Array<NaverPolyline | NaverMarker> = [];
+
+    routeSegments.forEach((segment) => {
+      if (segment.length === 0) return;
+      const path = segment.map((point) => {
+        const position = new maps.LatLng(point.latitude, point.longitude);
+        bounds.extend(position);
+        return position;
+      });
+      overlays.push(
+        new maps.Polyline({
+          map,
+          path,
+          strokeColor: "#16e58c",
+          strokeOpacity: 0.95,
+          strokeWeight: 6,
+          strokeLineCap: "round",
+          strokeLineJoin: "round",
+        }),
+      );
+    });
+
+    (ride.pauses ?? []).forEach((pause, index) => {
+      const position = new maps.LatLng(
+        pause.point.latitude,
+        pause.point.longitude,
+      );
+      overlays.push(
+        new maps.Marker({
+          map,
+          position,
+          title: `휴식 지점 ${index + 1}`,
+        }),
+      );
+    });
+
+    if (pointCount > 1) {
+      map.fitBounds(bounds, { top: 35, right: 35, bottom: 35, left: 35 });
+    } else {
+      map.setZoom(17);
+    }
+
+    return () => {
+      overlays.forEach((overlay) => overlay.setMap(null));
+      map.destroy();
+    };
+  }, [mapReady, pointCount, ride.pauses, routeSegments]);
+
+  return (
+    <div className="relative h-64 overflow-hidden rounded-3xl border border-white/10 bg-[#13201d]">
+      <div ref={elementRef} className="h-full w-full" aria-label="저장된 라이딩 경로" />
+      {pointCount === 0 && (
+        <div className="absolute inset-0 grid place-items-center text-sm text-white/40">
+          저장된 GPS 경로가 없습니다.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HistoryValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div>
+      <p className="text-[10px] text-white/35">{label}</p>
+      <p className="mt-1 font-mono text-xs font-semibold tabular-nums text-white/80">
+        {value}
+      </p>
+    </div>
+  );
+}
+
+function DetailMetric({
+  label,
+  value,
+  unit,
+  featured = false,
+}: {
+  label: string;
+  value: string;
+  unit?: string;
+  featured?: boolean | "rest";
+}) {
+  return (
+    <div
+      className={`rounded-2xl border p-4 ${
+        featured === "rest"
+          ? "border-amber-300/15 bg-amber-300/[0.07]"
+          : featured
+            ? "border-emerald-400/20 bg-emerald-400/[0.08]"
+            : "border-white/[0.08] bg-white/[0.045]"
+      }`}
+    >
+      <p className="text-xs text-white/40">{label}</p>
+      <div className="mt-2 flex items-end gap-1.5">
+        <strong className="font-mono text-xl leading-none tabular-nums">{value}</strong>
+        {unit && <span className="text-[10px] text-white/35">{unit}</span>}
+      </div>
+    </div>
   );
 }
 
