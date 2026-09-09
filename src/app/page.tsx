@@ -42,6 +42,17 @@ type NaverMapsApi = {
   Marker: new (options: object) => NaverMarker;
 };
 
+type WakeLockSentinelLike = {
+  release(): Promise<void>;
+};
+
+type NavigatorWithWakeLock = Navigator & {
+  wakeLock?: {
+    request(type: "screen"): Promise<WakeLockSentinelLike>;
+  };
+  standalone?: boolean;
+};
+
 declare global {
   interface Window {
     naver?: { maps: NaverMapsApi };
@@ -97,6 +108,8 @@ export default function Home() {
   const [snapshot, setSnapshot] = useState<RideSnapshot>(EMPTY_SNAPSHOT);
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState(false);
+  const [showInstallHint, setShowInstallHint] = useState(false);
+  const [installGuideOpen, setInstallGuideOpen] = useState(false);
 
   const mapElementRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<NaverMap | null>(null);
@@ -105,6 +118,7 @@ export default function Home() {
   const routeRef = useRef<GeoPoint[]>([]);
   const watchIdRef = useRef<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
   const isActiveRef = useRef(false);
   const hasFixRef = useRef(false);
   const startAtRef = useRef(0);
@@ -115,6 +129,23 @@ export default function Home() {
   const currentSpeedKmhRef = useRef(0);
   const maxSpeedKmhRef = useRef(0);
   const lastPointRef = useRef<GeoPoint | null>(null);
+
+  useEffect(() => {
+    const mobileNavigator = navigator as NavigatorWithWakeLock;
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+    const isStandalone =
+      window.matchMedia("(display-mode: standalone)").matches ||
+      mobileNavigator.standalone === true;
+
+    queueMicrotask(() => setShowInstallHint(isIOS && !isStandalone));
+
+    if ("serviceWorker" in navigator) {
+      const serviceWorkerUrl = new URL("sw.js", document.baseURI);
+      navigator.serviceWorker.register(serviceWorkerUrl.pathname).catch(() => {
+        // The ride tracker still works if offline caching is unavailable.
+      });
+    }
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -208,6 +239,7 @@ export default function Home() {
       if (timerRef.current !== null) {
         clearInterval(timerRef.current);
       }
+      void wakeLockRef.current?.release();
     };
   }, []);
 
@@ -278,6 +310,24 @@ export default function Home() {
     }
   };
 
+  const requestWakeLock = async () => {
+    const mobileNavigator = navigator as NavigatorWithWakeLock;
+    try {
+      wakeLockRef.current =
+        (await mobileNavigator.wakeLock?.request("screen")) ?? null;
+    } catch {
+      wakeLockRef.current = null;
+    }
+  };
+
+  const releaseWakeLock = async () => {
+    try {
+      await wakeLockRef.current?.release();
+    } finally {
+      wakeLockRef.current = null;
+    }
+  };
+
   const startRide = () => {
     if (!("geolocation" in navigator)) {
       setStatus("error");
@@ -304,6 +354,7 @@ export default function Home() {
     setSnapshot(EMPTY_SNAPSHOT);
     setStatus("locating");
     setMessage("GPS 신호를 찾고 있습니다…");
+    void requestWakeLock();
 
     timerRef.current = setInterval(() => updateClock(Date.now()), 1_000);
     watchIdRef.current = navigator.geolocation.watchPosition(
@@ -391,6 +442,7 @@ export default function Home() {
     updateClock(now);
     isActiveRef.current = false;
     clearTrackers();
+    void releaseWakeLock();
     currentSpeedKmhRef.current = 0;
     setSnapshot({ ...createSnapshot(now), currentSpeedKmh: 0 });
     setStatus("finished");
@@ -429,6 +481,26 @@ export default function Home() {
             {statusLabel}
           </div>
         </header>
+
+        {showInstallHint && (
+          <button
+            type="button"
+            onClick={() => setInstallGuideOpen(true)}
+            className="mb-3 flex w-full items-center justify-between rounded-2xl border border-emerald-400/20 bg-emerald-400/[0.08] px-4 py-3 text-left transition active:scale-[0.99]"
+          >
+            <span>
+              <span className="block text-sm font-semibold text-emerald-300">
+                아이폰에 앱으로 설치하기
+              </span>
+              <span className="mt-0.5 block text-[11px] text-white/45">
+                홈 화면에서 전체 화면으로 실행해요
+              </span>
+            </span>
+            <span className="rounded-full bg-emerald-400 px-3 py-1.5 text-xs font-bold text-[#04251a]">
+              방법 보기
+            </span>
+          </button>
+        )}
 
         <section className="relative h-[285px] overflow-hidden rounded-[28px] border border-white/10 bg-[#13201d] shadow-2xl shadow-black/30">
           <div ref={mapElementRef} className="h-full w-full" aria-label="주행 경로 지도" />
@@ -513,7 +585,73 @@ export default function Home() {
           </p>
         </div>
       </div>
+
+      {installGuideOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/65 px-3 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="install-title"
+          onClick={() => setInstallGuideOpen(false)}
+        >
+          <div
+            className="mb-[max(env(safe-area-inset-bottom),0.75rem)] w-full max-w-lg rounded-[28px] border border-white/10 bg-[#12201c] p-6 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="mb-5 flex items-start justify-between">
+              <div>
+                <p className="text-[11px] font-semibold tracking-[0.22em] text-emerald-400">
+                  INSTALL ON IPHONE
+                </p>
+                <h2 id="install-title" className="mt-1 text-xl font-bold">
+                  홈 화면에 바이크투어 추가
+                </h2>
+              </div>
+              <button
+                type="button"
+                aria-label="설치 안내 닫기"
+                onClick={() => setInstallGuideOpen(false)}
+                className="grid h-9 w-9 place-items-center rounded-full bg-white/[0.07] text-xl text-white/55"
+              >
+                ×
+              </button>
+            </div>
+
+            <ol className="space-y-4">
+              <InstallStep number="1" text="Safari 하단의 공유 버튼을 누르세요." symbol="⇧" />
+              <InstallStep number="2" text="메뉴에서 '홈 화면에 추가'를 선택하세요." symbol="+" />
+              <InstallStep number="3" text="오른쪽 위 '추가'를 누르면 설치가 완료됩니다." symbol="✓" />
+            </ol>
+
+            <p className="mt-5 rounded-xl bg-black/20 px-4 py-3 text-xs leading-5 text-white/50">
+              설치 후 홈 화면의 아이콘을 누르면 Safari 주소창 없이 앱처럼 실행됩니다.
+            </p>
+          </div>
+        </div>
+      )}
     </main>
+  );
+}
+
+function InstallStep({
+  number,
+  text,
+  symbol,
+}: {
+  number: string;
+  text: string;
+  symbol: string;
+}) {
+  return (
+    <li className="flex items-center gap-4">
+      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-emerald-400 text-lg font-bold text-[#04251a]">
+        {symbol}
+      </span>
+      <p className="text-sm leading-6 text-white/75">
+        <span className="mr-1.5 font-semibold text-white">{number}.</span>
+        {text}
+      </p>
+    </li>
   );
 }
 
