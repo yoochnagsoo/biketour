@@ -25,8 +25,20 @@ NEXT_PUBLIC_NAVER_MAP_CLIENT_ID=발급받은_Client_ID
 
 iOS 앱 빌드와 설치는 macOS, Xcode, 본인의 iPhone이 필요합니다.
 
+Mac의 터미널에서 프로젝트를 처음 받을 때 다음 명령을 실행합니다.
+
 ```bash
-npm install
+git clone https://github.com/yoochnagsoo/biketour.git
+cd biketour
+npm run mac:setup
+```
+
+`npm run mac:setup`은 의존성 설치, Next.js 빌드, iOS 동기화를 마친 뒤 Xcode를 자동으로 엽니다. Node.js 22 이상과 최신 Xcode가 먼저 설치되어 있어야 합니다. `.nvmrc`를 지원하는 Node 버전 관리자를 사용한다면 저장소에서 `nvm use`로 Node.js 24를 선택할 수 있습니다.
+
+이미 프로젝트를 받은 뒤 변경사항만 이어갈 때는 다음 명령을 사용합니다.
+
+```bash
+git pull origin master
 npm run ios:sync
 npm run ios:open
 ```

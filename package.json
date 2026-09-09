@@ -2,11 +2,15 @@
   "name": "biketour",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "mac:setup": "bash scripts/setup-macos.sh",
     "ios:sync": "npm run build && cap sync ios",
     "ios:open": "cap open ios"
   },
