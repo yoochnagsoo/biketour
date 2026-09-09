@@ -1,6 +1,11 @@
 "use client";
 
+import { Capacitor, type PluginListenerHandle } from "@capacitor/core";
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  NativeRideLocation,
+  type NativeLocationPoint,
+} from "@/lib/native-location";
 
 type RideStatus =
   | "idle"
@@ -139,6 +144,7 @@ export default function Home() {
   const [snapshot, setSnapshot] = useState<RideSnapshot>(EMPTY_SNAPSHOT);
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState(false);
+  const [isNativeApp, setIsNativeApp] = useState(false);
   const [showInstallHint, setShowInstallHint] = useState(false);
   const [installGuideOpen, setInstallGuideOpen] = useState(false);
   const [savedRides, setSavedRides] = useState<SavedRide[]>([]);
@@ -156,6 +162,8 @@ export default function Home() {
   const previewPointRef = useRef<GeoPoint | null>(null);
   const watchIdRef = useRef<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const nativeListenerHandlesRef = useRef<PluginListenerHandle[]>([]);
+  const nativeVisibilityHandlerRef = useRef<(() => void) | null>(null);
   const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
   const isActiveRef = useRef(false);
   const isPausedRef = useRef(false);
@@ -172,12 +180,16 @@ export default function Home() {
 
   useEffect(() => {
     const mobileNavigator = navigator as NavigatorWithWakeLock;
+    const nativeApp = Capacitor.isNativePlatform();
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
     const isStandalone =
       window.matchMedia("(display-mode: standalone)").matches ||
       mobileNavigator.standalone === true;
 
-    queueMicrotask(() => setShowInstallHint(isIOS && !isStandalone));
+    queueMicrotask(() => {
+      setIsNativeApp(nativeApp);
+      setShowInstallHint(isIOS && !isStandalone && !nativeApp);
+    });
 
     if ("serviceWorker" in navigator) {
       const serviceWorkerUrl = new URL("sw.js", document.baseURI);
@@ -382,6 +394,15 @@ export default function Home() {
       clearInterval(timerRef.current);
       timerRef.current = null;
     }
+    nativeListenerHandlesRef.current.forEach((handle) => void handle.remove());
+    nativeListenerHandlesRef.current = [];
+    if (nativeVisibilityHandlerRef.current) {
+      document.removeEventListener(
+        "visibilitychange",
+        nativeVisibilityHandlerRef.current,
+      );
+      nativeVisibilityHandlerRef.current = null;
+    }
   };
 
   const moveCurrentMarker = (point: GeoPoint) => {
@@ -454,8 +475,96 @@ export default function Home() {
     }
   };
 
-  const startRide = () => {
-    if (!("geolocation" in navigator)) {
+  const handleLocation = ({
+    latitude,
+    longitude,
+    accuracy,
+    speed,
+    timestamp,
+  }: NativeLocationPoint) => {
+    if (!isActiveRef.current) return;
+
+    if (accuracy > MAX_ACCEPTED_ACCURACY_M) {
+      setMessage(`GPS 정확도 개선 중 · 약 ${Math.round(accuracy)}m`);
+      return;
+    }
+
+    const point: GeoPoint = { latitude, longitude, timestamp };
+
+    if (isPausedRef.current) {
+      previewPointRef.current = point;
+      lastPointRef.current = point;
+      lastSpeedAtRef.current = Date.now();
+      currentSpeedKmhRef.current = 0;
+      moveCurrentMarker(point);
+      setSnapshot(createSnapshot(Date.now()));
+      return;
+    }
+
+    const previousPoint = lastPointRef.current;
+    let segmentDistanceM = 0;
+    let calculatedSpeedKmh = 0;
+
+    if (previousPoint) {
+      segmentDistanceM = haversineDistance(previousPoint, point);
+      const elapsedHours = (timestamp - previousPoint.timestamp) / 3_600_000;
+      calculatedSpeedKmh = elapsedHours > 0
+        ? segmentDistanceM / 1000 / elapsedHours
+        : 0;
+    }
+
+    const sensorSpeedKmh = speed === null ? null : Math.max(0, speed * 3.6);
+    const speedKmh = Math.min(
+      sensorSpeedKmh ?? calculatedSpeedKmh,
+      MAX_REASONABLE_SPEED_KMH,
+    );
+    const segmentIsValid =
+      previousPoint !== null &&
+      segmentDistanceM >= 2 &&
+      calculatedSpeedKmh <= MAX_REASONABLE_SPEED_KMH;
+
+    if (!previousPoint || segmentIsValid) {
+      const currentSegment = routeSegmentsRef.current.at(-1);
+      currentSegment?.push(point);
+      if (segmentIsValid) {
+        distanceMRef.current += segmentDistanceM;
+      }
+      drawPoint(point);
+    }
+
+    lastPointRef.current = point;
+    lastSpeedAtRef.current = Date.now();
+    currentSpeedKmhRef.current = speedKmh;
+    maxSpeedKmhRef.current = Math.max(maxSpeedKmhRef.current, speedKmh);
+    hasFixRef.current = true;
+    setStatus("recording");
+    setMessage(`GPS 연결됨 · 정확도 약 ${Math.round(accuracy)}m`);
+    setSnapshot(createSnapshot(Date.now()));
+  };
+
+  const handleLocationError = (message?: string) => {
+    setMessage(
+      message
+        ? `GPS 오류 · ${message}`
+        : "GPS 신호가 약합니다. 하늘이 잘 보이는 곳에서 기다려주세요.",
+    );
+  };
+
+  const syncNativeLocations = async () => {
+    if (!Capacitor.isNativePlatform() || !isActiveRef.current) return;
+    try {
+      const { locations } = await NativeRideLocation.drainLocations();
+      locations
+        .sort((a, b) => a.timestamp - b.timestamp)
+        .forEach(handleLocation);
+    } catch {
+      handleLocationError("백그라운드 위치를 불러오지 못했습니다.");
+    }
+  };
+
+  const startRide = async () => {
+    const isNative = Capacitor.isNativePlatform();
+    if (!isNative && !("geolocation" in navigator)) {
       setStatus("error");
       setMessage("이 브라우저에서는 GPS 위치 기능을 사용할 수 없습니다.");
       return;
@@ -487,75 +596,54 @@ export default function Home() {
     setSnapshot(EMPTY_SNAPSHOT);
     setStatus("locating");
     setMessage("GPS 신호를 찾고 있습니다…");
-    void requestWakeLock();
+    if (!isNative) void requestWakeLock();
 
     timerRef.current = setInterval(() => updateClock(Date.now()), 1_000);
+
+    if (isNative) {
+      try {
+        const locationHandle = await NativeRideLocation.addListener(
+          "location",
+          handleLocation,
+        );
+        const errorHandle = await NativeRideLocation.addListener(
+          "locationError",
+          ({ message }) => handleLocationError(message),
+        );
+        nativeListenerHandlesRef.current = [locationHandle, errorHandle];
+        nativeVisibilityHandlerRef.current = () => {
+          if (document.visibilityState === "visible") {
+            void syncNativeLocations();
+          }
+        };
+        document.addEventListener(
+          "visibilitychange",
+          nativeVisibilityHandlerRef.current,
+        );
+        await NativeRideLocation.start();
+        setMessage("네이티브 GPS 연결 중 · 화면을 꺼도 기록됩니다.");
+      } catch (error) {
+        isActiveRef.current = false;
+        clearTrackers();
+        setStatus("error");
+        setMessage(
+          error instanceof Error
+            ? error.message
+            : "위치 권한이 필요합니다. iPhone 설정을 확인해주세요.",
+        );
+      }
+      return;
+    }
+
     watchIdRef.current = navigator.geolocation.watchPosition(
       ({ coords, timestamp }) => {
-        if (!isActiveRef.current) return;
-
-        if (coords.accuracy > MAX_ACCEPTED_ACCURACY_M) {
-          setMessage(`GPS 정확도 개선 중 · 약 ${Math.round(coords.accuracy)}m`);
-          return;
-        }
-
-        const point: GeoPoint = {
+        handleLocation({
           latitude: coords.latitude,
           longitude: coords.longitude,
+          accuracy: coords.accuracy,
+          speed: coords.speed,
           timestamp,
-        };
-
-        if (isPausedRef.current) {
-          previewPointRef.current = point;
-          lastPointRef.current = point;
-          lastSpeedAtRef.current = Date.now();
-          currentSpeedKmhRef.current = 0;
-          moveCurrentMarker(point);
-          setSnapshot(createSnapshot(Date.now()));
-          return;
-        }
-
-        const previousPoint = lastPointRef.current;
-        let segmentDistanceM = 0;
-        let calculatedSpeedKmh = 0;
-
-        if (previousPoint) {
-          segmentDistanceM = haversineDistance(previousPoint, point);
-          const elapsedHours = (timestamp - previousPoint.timestamp) / 3_600_000;
-          calculatedSpeedKmh = elapsedHours > 0
-            ? segmentDistanceM / 1000 / elapsedHours
-            : 0;
-        }
-
-        const sensorSpeedKmh = coords.speed === null
-          ? null
-          : Math.max(0, coords.speed * 3.6);
-        const speedKmh = Math.min(
-          sensorSpeedKmh ?? calculatedSpeedKmh,
-          MAX_REASONABLE_SPEED_KMH,
-        );
-        const segmentIsValid =
-          previousPoint !== null &&
-          segmentDistanceM >= 2 &&
-          calculatedSpeedKmh <= MAX_REASONABLE_SPEED_KMH;
-
-        if (!previousPoint || segmentIsValid) {
-          const currentSegment = routeSegmentsRef.current.at(-1);
-          currentSegment?.push(point);
-          if (segmentIsValid) {
-            distanceMRef.current += segmentDistanceM;
-          }
-          drawPoint(point);
-        }
-
-        lastPointRef.current = point;
-        lastSpeedAtRef.current = Date.now();
-        currentSpeedKmhRef.current = speedKmh;
-        maxSpeedKmhRef.current = Math.max(maxSpeedKmhRef.current, speedKmh);
-        hasFixRef.current = true;
-        setStatus("recording");
-        setMessage(`GPS 연결됨 · 정확도 약 ${Math.round(coords.accuracy)}m`);
-        setSnapshot(createSnapshot(Date.now()));
+        });
       },
       (error) => {
         if (error.code === error.PERMISSION_DENIED) {
@@ -599,7 +687,11 @@ export default function Home() {
     setSnapshot({ ...createSnapshot(now), currentSpeedKmh: 0 });
     setStatus("paused");
     setMessage("라이딩 일시정지 · 휴식시간을 기록하고 있습니다.");
-    void releaseWakeLock();
+    if (Capacitor.isNativePlatform()) {
+      void NativeRideLocation.pause();
+    } else {
+      void releaseWakeLock();
+    }
   };
 
   const resumeRide = () => {
@@ -618,7 +710,11 @@ export default function Home() {
     activePolylineRef.current = null;
     setStatus("recording");
     setMessage("라이딩 재개 · GPS 신호를 확인하고 있습니다…");
-    void requestWakeLock();
+    if (Capacitor.isNativePlatform()) {
+      void NativeRideLocation.resume();
+    } else {
+      void requestWakeLock();
+    }
   };
 
   const saveRide = (ride: SavedRide) => {
@@ -636,8 +732,13 @@ export default function Home() {
     }
   };
 
-  const finishRide = () => {
+  const finishRide = async () => {
     if (!isActiveRef.current) return;
+
+    if (Capacitor.isNativePlatform()) {
+      await syncNativeLocations();
+      await NativeRideLocation.stop().catch(() => undefined);
+    }
 
     const now = Date.now();
     updateClock(now);
@@ -879,7 +980,9 @@ export default function Home() {
             </button>
           )}
           <p className="mt-3 text-center text-[11px] leading-4 text-white/35">
-            저장된 라이딩 {savedRides.length}개 · 라이딩 중 화면을 켜두세요.
+            저장된 라이딩 {savedRides.length}개 · {isNativeApp
+              ? "화면 잠금 중에도 GPS를 기록합니다."
+              : "라이딩 중 화면을 켜두세요."}
           </p>
         </div>
       </div>
