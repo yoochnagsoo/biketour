@@ -2,7 +2,13 @@
 
 import { useEffect, useRef, useState } from "react";
 
-type RideStatus = "idle" | "locating" | "recording" | "finished" | "error";
+type RideStatus =
+  | "idle"
+  | "locating"
+  | "recording"
+  | "paused"
+  | "finished"
+  | "error";
 
 type GeoPoint = {
   latitude: number;
@@ -13,6 +19,7 @@ type GeoPoint = {
 type RideSnapshot = {
   distanceM: number;
   stoppedMs: number;
+  restMs: number;
   totalMs: number;
   currentSpeedKmh: number;
   averageSpeedKmh: number;
@@ -27,6 +34,7 @@ type NaverMap = {
 };
 
 type NaverPolyline = {
+  setMap(map: NaverMap | null): void;
   setPath(path: NaverLatLng[]): void;
 };
 
@@ -53,6 +61,21 @@ type NavigatorWithWakeLock = Navigator & {
   standalone?: boolean;
 };
 
+type PauseRecord = {
+  point: GeoPoint;
+  startedAt: number;
+  endedAt: number | null;
+};
+
+type SavedRide = {
+  id: string;
+  startedAt: number;
+  endedAt: number;
+  summary: RideSnapshot;
+  routeSegments: GeoPoint[][];
+  pauses: PauseRecord[];
+};
+
 declare global {
   interface Window {
     naver?: { maps: NaverMapsApi };
@@ -63,6 +86,7 @@ declare global {
 const EMPTY_SNAPSHOT: RideSnapshot = {
   distanceM: 0,
   stoppedMs: 0,
+  restMs: 0,
   totalMs: 0,
   currentSpeedKmh: 0,
   averageSpeedKmh: 0,
@@ -110,21 +134,28 @@ export default function Home() {
   const [mapError, setMapError] = useState(false);
   const [showInstallHint, setShowInstallHint] = useState(false);
   const [installGuideOpen, setInstallGuideOpen] = useState(false);
+  const [savedRideCount, setSavedRideCount] = useState(0);
 
   const mapElementRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<NaverMap | null>(null);
-  const polylineRef = useRef<NaverPolyline | null>(null);
+  const activePolylineRef = useRef<NaverPolyline | null>(null);
+  const polylinesRef = useRef<NaverPolyline[]>([]);
   const markerRef = useRef<NaverMarker | null>(null);
-  const routeRef = useRef<GeoPoint[]>([]);
+  const pauseMarkersRef = useRef<NaverMarker[]>([]);
+  const routeSegmentsRef = useRef<GeoPoint[][]>([[]]);
+  const pauseRecordsRef = useRef<PauseRecord[]>([]);
+  const previewPointRef = useRef<GeoPoint | null>(null);
   const watchIdRef = useRef<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const wakeLockRef = useRef<WakeLockSentinelLike | null>(null);
   const isActiveRef = useRef(false);
+  const isPausedRef = useRef(false);
   const hasFixRef = useRef(false);
   const startAtRef = useRef(0);
   const lastTimerAtRef = useRef(0);
   const lastSpeedAtRef = useRef(0);
   const stoppedMsRef = useRef(0);
+  const restMsRef = useRef(0);
   const distanceMRef = useRef(0);
   const currentSpeedKmhRef = useRef(0);
   const maxSpeedKmhRef = useRef(0);
@@ -145,6 +176,50 @@ export default function Home() {
         // The ride tracker still works if offline caching is unavailable.
       });
     }
+  }, []);
+
+  useEffect(() => {
+    try {
+      const savedRides = JSON.parse(localStorage.getItem("biketour-rides") ?? "[]");
+      if (Array.isArray(savedRides)) {
+        queueMicrotask(() => setSavedRideCount(savedRides.length));
+      }
+    } catch {
+      // Ignore malformed data from an older app version.
+    }
+
+    if (!("geolocation" in navigator)) return;
+
+    navigator.geolocation.getCurrentPosition(
+      ({ coords, timestamp }) => {
+        const point: GeoPoint = {
+          latitude: coords.latitude,
+          longitude: coords.longitude,
+          timestamp,
+        };
+        previewPointRef.current = point;
+
+        if (window.naver && mapRef.current) {
+          const position = new window.naver.maps.LatLng(
+            point.latitude,
+            point.longitude,
+          );
+          mapRef.current.setCenter(position);
+          mapRef.current.setZoom(17);
+          markerRef.current = new window.naver.maps.Marker({
+            map: mapRef.current,
+            position,
+          });
+        }
+        setMessage(`현재 위치를 찾았습니다 · 정확도 약 ${Math.round(coords.accuracy)}m`);
+      },
+      (error) => {
+        if (error.code === error.PERMISSION_DENIED) {
+          setMessage("현재 위치를 보려면 Safari에서 위치 권한을 허용해주세요.");
+        }
+      },
+      { enableHighAccuracy: true, maximumAge: 15_000, timeout: 12_000 },
+    );
   }, []);
 
   useEffect(() => {
@@ -186,8 +261,9 @@ export default function Home() {
     }
 
     const maps = window.naver.maps;
-    const route = routeRef.current;
-    const initialPoint = route.at(-1);
+    const routeSegments = routeSegmentsRef.current;
+    const initialPoint =
+      routeSegments.at(-1)?.at(-1) ?? previewPointRef.current;
     const center = new maps.LatLng(
       initialPoint?.latitude ?? 37.5666103,
       initialPoint?.longitude ?? 126.9783882,
@@ -199,20 +275,24 @@ export default function Home() {
       scaleControl: false,
       mapDataControl: false,
     });
-    const path = route.map(
-      (point) => new maps.LatLng(point.latitude, point.longitude),
-    );
-
     mapRef.current = map;
-    polylineRef.current = new maps.Polyline({
-      map,
-      path,
-      strokeColor: "#16e58c",
-      strokeOpacity: 0.95,
-      strokeWeight: 6,
-      strokeLineCap: "round",
-      strokeLineJoin: "round",
-    });
+    polylinesRef.current = routeSegments
+      .filter((segment) => segment.length > 0)
+      .map(
+        (segment) =>
+          new maps.Polyline({
+            map,
+            path: segment.map(
+              (point) => new maps.LatLng(point.latitude, point.longitude),
+            ),
+            strokeColor: "#16e58c",
+            strokeOpacity: 0.95,
+            strokeWeight: 6,
+            strokeLineCap: "round",
+            strokeLineJoin: "round",
+          }),
+      );
+    activePolylineRef.current = polylinesRef.current.at(-1) ?? null;
 
     if (initialPoint) {
       markerRef.current = new maps.Marker({ map, position: center });
@@ -245,7 +325,10 @@ export default function Home() {
 
   const createSnapshot = (now: number): RideSnapshot => {
     const totalMs = startAtRef.current ? now - startAtRef.current : 0;
-    const movingMs = Math.max(0, totalMs - stoppedMsRef.current);
+    const movingMs = Math.max(
+      0,
+      totalMs - stoppedMsRef.current - restMsRef.current,
+    );
     const averageSpeedKmh = movingMs
       ? (distanceMRef.current / 1000) / (movingMs / 3_600_000)
       : 0;
@@ -253,6 +336,7 @@ export default function Home() {
     return {
       distanceM: distanceMRef.current,
       stoppedMs: stoppedMsRef.current,
+      restMs: restMsRef.current,
       totalMs,
       currentSpeedKmh: currentSpeedKmhRef.current,
       averageSpeedKmh,
@@ -264,7 +348,9 @@ export default function Home() {
     const elapsed = Math.max(0, now - lastTimerAtRef.current);
     const gpsIsStale = now - lastSpeedAtRef.current > 8_000;
 
-    if (
+    if (isPausedRef.current) {
+      restMsRef.current += elapsed;
+    } else if (
       hasFixRef.current &&
       (gpsIsStale || currentSpeedKmhRef.current < STOP_SPEED_KMH)
     ) {
@@ -289,18 +375,10 @@ export default function Home() {
     }
   };
 
-  const drawPoint = (point: GeoPoint) => {
-    if (!window.naver || !mapRef.current || !polylineRef.current) {
-      return;
-    }
-
+  const moveCurrentMarker = (point: GeoPoint) => {
+    if (!window.naver || !mapRef.current) return;
     const maps = window.naver.maps;
     const position = new maps.LatLng(point.latitude, point.longitude);
-    const path = routeRef.current.map(
-      (routePoint) => new maps.LatLng(routePoint.latitude, routePoint.longitude),
-    );
-
-    polylineRef.current.setPath(path);
     mapRef.current.setCenter(position);
 
     if (markerRef.current) {
@@ -308,6 +386,45 @@ export default function Home() {
     } else {
       markerRef.current = new maps.Marker({ map: mapRef.current, position });
     }
+  };
+
+  const drawPoint = (point: GeoPoint) => {
+    if (!window.naver || !mapRef.current) return;
+
+    const maps = window.naver.maps;
+    const currentSegment = routeSegmentsRef.current.at(-1) ?? [];
+
+    if (!activePolylineRef.current) {
+      activePolylineRef.current = new maps.Polyline({
+        map: mapRef.current,
+        path: [],
+        strokeColor: "#16e58c",
+        strokeOpacity: 0.95,
+        strokeWeight: 6,
+        strokeLineCap: "round",
+        strokeLineJoin: "round",
+      });
+      polylinesRef.current.push(activePolylineRef.current);
+    }
+
+    activePolylineRef.current.setPath(
+      currentSegment.map(
+        (routePoint) =>
+          new maps.LatLng(routePoint.latitude, routePoint.longitude),
+      ),
+    );
+    moveCurrentMarker(point);
+  };
+
+  const markPausePoint = (point: GeoPoint) => {
+    if (!window.naver || !mapRef.current) return;
+
+    const marker = new window.naver.maps.Marker({
+      map: mapRef.current,
+      position: new window.naver.maps.LatLng(point.latitude, point.longitude),
+      title: `휴식 지점 ${pauseRecordsRef.current.length}`,
+    });
+    pauseMarkersRef.current.push(marker);
   };
 
   const requestWakeLock = async () => {
@@ -338,17 +455,24 @@ export default function Home() {
     clearTrackers();
     const now = Date.now();
     isActiveRef.current = true;
+    isPausedRef.current = false;
     hasFixRef.current = false;
     startAtRef.current = now;
     lastTimerAtRef.current = now;
     lastSpeedAtRef.current = 0;
     stoppedMsRef.current = 0;
+    restMsRef.current = 0;
     distanceMRef.current = 0;
     currentSpeedKmhRef.current = 0;
     maxSpeedKmhRef.current = 0;
     lastPointRef.current = null;
-    routeRef.current = [];
-    polylineRef.current?.setPath([]);
+    polylinesRef.current.forEach((polyline) => polyline.setMap(null));
+    pauseMarkersRef.current.forEach((pauseMarker) => pauseMarker.setMap(null));
+    polylinesRef.current = [];
+    pauseMarkersRef.current = [];
+    activePolylineRef.current = null;
+    routeSegmentsRef.current = [[]];
+    pauseRecordsRef.current = [];
     markerRef.current?.setMap(null);
     markerRef.current = null;
     setSnapshot(EMPTY_SNAPSHOT);
@@ -371,6 +495,17 @@ export default function Home() {
           longitude: coords.longitude,
           timestamp,
         };
+
+        if (isPausedRef.current) {
+          previewPointRef.current = point;
+          lastPointRef.current = point;
+          lastSpeedAtRef.current = Date.now();
+          currentSpeedKmhRef.current = 0;
+          moveCurrentMarker(point);
+          setSnapshot(createSnapshot(Date.now()));
+          return;
+        }
+
         const previousPoint = lastPointRef.current;
         let segmentDistanceM = 0;
         let calculatedSpeedKmh = 0;
@@ -396,7 +531,8 @@ export default function Home() {
           calculatedSpeedKmh <= MAX_REASONABLE_SPEED_KMH;
 
         if (!previousPoint || segmentIsValid) {
-          routeRef.current.push(point);
+          const currentSegment = routeSegmentsRef.current.at(-1);
+          currentSegment?.push(point);
           if (segmentIsValid) {
             distanceMRef.current += segmentDistanceM;
           }
@@ -435,25 +571,110 @@ export default function Home() {
     );
   };
 
+  const pauseRide = () => {
+    if (!isActiveRef.current || isPausedRef.current || !lastPointRef.current) {
+      return;
+    }
+
+    const now = Date.now();
+    updateClock(now);
+    isPausedRef.current = true;
+    currentSpeedKmhRef.current = 0;
+    const pausePoint = { ...lastPointRef.current, timestamp: now };
+    pauseRecordsRef.current.push({
+      point: pausePoint,
+      startedAt: now,
+      endedAt: null,
+    });
+    markPausePoint(pausePoint);
+    setSnapshot({ ...createSnapshot(now), currentSpeedKmh: 0 });
+    setStatus("paused");
+    setMessage("라이딩 일시정지 · 휴식시간을 기록하고 있습니다.");
+    void releaseWakeLock();
+  };
+
+  const resumeRide = () => {
+    if (!isActiveRef.current || !isPausedRef.current) return;
+
+    const now = Date.now();
+    updateClock(now);
+    const currentPause = pauseRecordsRef.current.at(-1);
+    if (currentPause && currentPause.endedAt === null) {
+      currentPause.endedAt = now;
+    }
+    isPausedRef.current = false;
+    lastPointRef.current = null;
+    currentSpeedKmhRef.current = 0;
+    routeSegmentsRef.current.push([]);
+    activePolylineRef.current = null;
+    setStatus("recording");
+    setMessage("라이딩 재개 · GPS 신호를 확인하고 있습니다…");
+    void requestWakeLock();
+  };
+
+  const saveRide = (ride: SavedRide) => {
+    try {
+      const savedRides = JSON.parse(
+        localStorage.getItem("biketour-rides") ?? "[]",
+      );
+      const rides = Array.isArray(savedRides) ? savedRides : [];
+      const updatedRides = [ride, ...rides].slice(0, 50);
+      localStorage.setItem("biketour-rides", JSON.stringify(updatedRides));
+      setSavedRideCount(updatedRides.length);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const finishRide = () => {
     if (!isActiveRef.current) return;
 
     const now = Date.now();
     updateClock(now);
+    const currentPause = pauseRecordsRef.current.at(-1);
+    if (isPausedRef.current && currentPause && currentPause.endedAt === null) {
+      currentPause.endedAt = now;
+    }
     isActiveRef.current = false;
+    isPausedRef.current = false;
     clearTrackers();
     void releaseWakeLock();
     currentSpeedKmhRef.current = 0;
-    setSnapshot({ ...createSnapshot(now), currentSpeedKmh: 0 });
+    const finalSnapshot = { ...createSnapshot(now), currentSpeedKmh: 0 };
+    const ride: SavedRide = {
+      id:
+        typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `${startAtRef.current}-${now}`,
+      startedAt: startAtRef.current,
+      endedAt: now,
+      summary: finalSnapshot,
+      routeSegments: routeSegmentsRef.current
+        .filter((segment) => segment.length > 0)
+        .map((segment) => segment.map((point) => ({ ...point }))),
+      pauses: pauseRecordsRef.current.map((pause) => ({
+        ...pause,
+        point: { ...pause.point },
+      })),
+    };
+    const saved = saveRide(ride);
+    setSnapshot(finalSnapshot);
     setStatus("finished");
-    setMessage("라이딩이 종료되었습니다. 수고하셨어요!");
+    setMessage(
+      saved
+        ? "라이딩이 종료되어 이 기기에 저장됐습니다."
+        : "라이딩은 종료됐지만 저장공간을 확인해주세요.",
+    );
   };
 
-  const isRiding = status === "locating" || status === "recording";
+  const isRiding =
+    status === "locating" || status === "recording" || status === "paused";
   const statusLabel = {
     idle: "준비",
     locating: "GPS 연결 중",
     recording: "기록 중",
+    paused: "휴식 중",
     finished: "완료",
     error: "확인 필요",
   }[status];
@@ -473,6 +694,8 @@ export default function Home() {
               className={`h-2 w-2 rounded-full ${
                 status === "recording"
                   ? "animate-pulse bg-emerald-400"
+                  : status === "paused"
+                    ? "animate-pulse bg-amber-300"
                   : status === "error"
                     ? "bg-amber-400"
                     : "bg-white/30"
@@ -552,16 +775,63 @@ export default function Home() {
             value={snapshot.maxSpeedKmh.toFixed(1)}
             unit="km/h"
           />
-          <div className="col-span-2 flex items-center justify-between rounded-2xl border border-white/[0.08] bg-white/[0.045] px-5 py-4">
-            <span className="text-sm text-white/50">정지시간</span>
-            <strong className="font-mono text-xl tabular-nums">
+          <div className="rounded-2xl border border-white/[0.08] bg-white/[0.045] p-4">
+            <span className="text-xs text-white/45">정지시간</span>
+            <strong className="mt-2 block font-mono text-lg tabular-nums">
               {formatDuration(snapshot.stoppedMs)}
+            </strong>
+          </div>
+          <div className="rounded-2xl border border-amber-300/15 bg-amber-300/[0.07] p-4">
+            <span className="text-xs text-amber-100/50">휴식시간</span>
+            <strong className="mt-2 block font-mono text-lg tabular-nums text-amber-100">
+              {formatDuration(snapshot.restMs)}
             </strong>
           </div>
         </section>
 
         <div className="mt-auto pt-5">
-          {isRiding ? (
+          {status === "recording" ? (
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={pauseRide}
+                className="flex h-16 items-center justify-center gap-2 rounded-2xl bg-amber-300 text-base font-bold text-[#352508] transition active:scale-[0.98] active:bg-amber-200"
+              >
+                <span className="flex gap-1">
+                  <span className="h-4 w-1.5 rounded-sm bg-[#352508]" />
+                  <span className="h-4 w-1.5 rounded-sm bg-[#352508]" />
+                </span>
+                일시정지
+              </button>
+              <button
+                type="button"
+                onClick={finishRide}
+                className="flex h-16 items-center justify-center gap-2 rounded-2xl border border-red-400/20 bg-red-500/15 text-base font-semibold text-red-200 transition active:scale-[0.98] active:bg-red-500/25"
+              >
+                <span className="h-3.5 w-3.5 rounded-[3px] bg-red-400" />
+                라이딩 종료
+              </button>
+            </div>
+          ) : status === "paused" ? (
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                type="button"
+                onClick={resumeRide}
+                className="flex h-16 items-center justify-center gap-2 rounded-2xl bg-emerald-400 text-base font-bold text-[#04251a] transition active:scale-[0.98] active:bg-emerald-300"
+              >
+                <span className="h-0 w-0 border-y-[6px] border-l-[10px] border-y-transparent border-l-[#04251a]" />
+                라이딩 재개
+              </button>
+              <button
+                type="button"
+                onClick={finishRide}
+                className="flex h-16 items-center justify-center gap-2 rounded-2xl border border-red-400/20 bg-red-500/15 text-base font-semibold text-red-200 transition active:scale-[0.98] active:bg-red-500/25"
+              >
+                <span className="h-3.5 w-3.5 rounded-[3px] bg-red-400" />
+                라이딩 종료
+              </button>
+            </div>
+          ) : isRiding ? (
             <button
               type="button"
               onClick={finishRide}
@@ -581,7 +851,7 @@ export default function Home() {
             </button>
           )}
           <p className="mt-3 text-center text-[11px] leading-4 text-white/35">
-            정확한 기록을 위해 라이딩 중 화면을 켜두세요.
+            저장된 라이딩 {savedRideCount}개 · 라이딩 중 화면을 켜두세요.
           </p>
         </div>
       </div>
